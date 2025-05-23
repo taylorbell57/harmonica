@@ -1,5 +1,5 @@
 import numpy as np
-from harmonica import bindings
+from harmonica.core import bindings
 
 
 class HarmonicaTransit(object):
@@ -193,8 +193,8 @@ class HarmonicaTransit(object):
         -------
         if r.ndim == 1:
             r_p : ndarray (N,)
-                The transmission string, :math:`r_{\\rm{p}}(\\theta)`, evaluated
-                at N thetas.
+                The transmission string, :math:`r_{\\rm{p}}(\\theta)`,
+                evaluated at N thetas.
         elif r.ndim == 2:
             r_p : ndarray (M, N)
                 The transmission strings, :math:`r_{\\rm{p}}(\\theta)`, each
