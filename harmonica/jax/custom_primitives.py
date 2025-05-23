@@ -3,14 +3,39 @@ import numpy as np
 import jax.numpy as jnp
 from jaxlib import xla_client
 from functools import partial
-from jax.interpreters import ad, xla
+from jax.interpreters import ad, mlir
+from jax._src.interpreters import mlir as jax_mlir
+from jax._src.interpreters.mlir import ir, custom_call
+from jaxlib.mlir.dialects import mhlo
 
-from harmonica import bindings
+from harmonica.core import bindings
 
 # Enable double floating precision.
 jax.config.update("jax_enable_x64", True)
 
 
+def ir_dtype(np_dtype):
+    """Convert a NumPy dtype or Python type to an MLIR IR type."""
+    np_dtype = np.dtype(np_dtype)
+    if np_dtype == np.float32:
+        return ir.F32Type.get()
+    elif np_dtype == np.float64:
+        return ir.F64Type.get()
+    elif np_dtype == np.int32:
+        return ir.IntegerType.get_signless(32)
+    elif np_dtype == np.int64:
+        return ir.IntegerType.get_signless(64)
+    else:
+        raise TypeError(f"Unsupported dtype: {np_dtype}")
+
+
+def ir_constant(val):
+    dtype = ir_dtype(type(val))
+    attr = ir.DenseElementsAttr.get(np.array(val).reshape(()).astype(np.dtype(type(val))))
+    return mhlo.ConstantOp(attr).result
+
+
+@jax.jit
 def harmonica_transit_quad_ld(times, t0, period, a, inc, ecc=0., omega=0.,
                               u1=0., u2=0., r=jnp.array([0.1])):
     """ Harmonica transits with jax -- quadratic limb darkening.
@@ -82,45 +107,40 @@ def jax_light_curve_quad_ld_abstract_eval(abstract_times, *abstract_params):
     return abstract_model_eval, abstract_model_derivatives
 
 
-def jax_light_curve_quad_ld_xla_translation(c, timesc, *paramssc):
+def jax_light_curve_quad_ld_xla_translation(ctx, timesc, *paramssc):
     """ XLA compilation rules. """
     # Get `shape` info.
-    timesc_shape = c.get_shape(timesc)
+    timesc_shape = ctx.avals_in[0]
 
     # Define input `shapes`.
-    data_type = timesc_shape.element_type()
-    shape = timesc_shape.dimensions()
+    data_type = timesc_shape.dtype
+    shape = timesc_shape.shape
     dims_order = tuple(range(len(shape) - 1, -1, -1))
-    input_shape = xla_client.Shape.array_shape(data_type, shape, dims_order)
-    rs_input_shapes = tuple(input_shape for ic in paramssc)
+    input_shape = ir.RankedTensorType.get(shape, ir_dtype(data_type))
+    rs_input_shapes = [input_shape] * len(paramssc)
 
     # Additionally, define the number of model evaluation points.
     n_times = np.prod(shape).astype(np.int64)
-    n_times_input = xla_client.ops.ConstantLiteral(c, n_times)
-    n_times_shape = xla_client.Shape.array_shape(np.dtype(np.int64), (), ())
+    n_times_type = ir.RankedTensorType.get((), ir_dtype(np.int64))
+    n_times_const = ir_constant(np.int64(n_times))
 
     # Additionally, define the number of transmission string coefficients.
     n_rs = len(paramssc) - 6 - 2
-    n_rs_input = xla_client.ops.ConstantLiteral(c, n_rs)
-    n_rs_shape = xla_client.Shape.array_shape(np.dtype(np.int64), (), ())
+    n_rs_type = ir.RankedTensorType.get((), ir_dtype(np.int64))
+    n_rs_const = ir_constant(np.int64(n_rs))
 
     # Define output `shapes`.
-    output_shape_model_eval = input_shape
+    output_shape_model_eval = ir.RankedTensorType.get(shape, ir_dtype(data_type))
     shape_derivatives = shape + (6 + 2 + n_rs,)
-    dims_order_derivatives = tuple(range(len(shape), -1, -1))
-    output_shape_model_derivatives = xla_client.Shape.array_shape(
-        data_type, shape_derivatives, dims_order_derivatives)
+    output_shape_model_derivatives = ir.RankedTensorType.get(shape_derivatives, ir_dtype(data_type))
 
-    return xla_client.ops.CustomCallWithLayout(
-        c,
+    return custom_call(
         b"jax_light_curve_quad_ld",
-        operands=(n_times_input, n_rs_input, timesc, *paramssc),
-        operand_shapes_with_layout=
-            (n_times_shape, n_rs_shape, input_shape)
-            + rs_input_shapes,
-        shape_with_layout=xla_client.Shape.tuple_shape(
-            (output_shape_model_eval,
-             output_shape_model_derivatives)))
+        result_types=[output_shape_model_eval, output_shape_model_derivatives],
+        operands=[n_times_const, n_rs_const, timesc, *paramssc],
+        operand_layouts=[(), (), list(reversed(range(len(shape))))] + [list(reversed(range(len(shape))))] * len(paramssc),
+        result_layouts=[list(reversed(range(len(shape)))), list(reversed(range(len(shape_derivatives))))]
+   ).results
 
 
 def jax_light_curve_quad_ld_value_and_jvp(arg_values, arg_tangents):
@@ -146,6 +166,7 @@ def jax_light_curve_quad_ld_value_and_jvp(arg_values, arg_tangents):
     return (f, df_dz), (df, None)
 
 
+@jax.jit
 def harmonica_transit_nonlinear_ld(times, t0, period, a, inc, ecc=0., omega=0.,
                                    u1=0., u2=0., u3=0., u4=0.,
                                    r=jnp.array([0.1])):
@@ -218,45 +239,32 @@ def jax_light_curve_nonlinear_ld_abstract_eval(abstract_times, *abstract_params)
     return abstract_model_eval, abstract_model_derivatives
 
 
-def jax_light_curve_nonlinear_xla_translation(c, timesc, *paramssc):
-    """ XLA compilation rules. """
-    # Get `shape` info.
-    timesc_shape = c.get_shape(timesc)
+def jax_light_curve_nonlinear_xla_translation(ctx, timesc, *paramssc):
+    """MLIR lowering for nonlinear LD transit model."""
+    timesc_shape = ctx.avals_in[0]
+    data_type = timesc_shape.dtype
+    shape = timesc_shape.shape
 
-    # Define input `shapes`.
-    data_type = timesc_shape.element_type()
-    shape = timesc_shape.dimensions()
-    dims_order = tuple(range(len(shape) - 1, -1, -1))
-    input_shape = xla_client.Shape.array_shape(data_type, shape, dims_order)
-    rs_input_shapes = tuple(input_shape for ic in paramssc)
+    input_shape = ir.RankedTensorType.get(shape, ir_dtype(data_type))
+    rs_input_shapes = [input_shape] * len(paramssc)
 
-    # Additionally, define the number of model evaluation points.
     n_times = np.prod(shape).astype(np.int64)
-    n_times_input = xla_client.ops.ConstantLiteral(c, n_times)
-    n_times_shape = xla_client.Shape.array_shape(np.dtype(np.int64), (), ())
+    n_times_const = ir_constant(n_times)
 
-    # Additionally, define the number of transmission string coefficients.
     n_rs = len(paramssc) - 6 - 4
-    n_rs_input = xla_client.ops.ConstantLiteral(c, n_rs)
-    n_rs_shape = xla_client.Shape.array_shape(np.dtype(np.int64), (), ())
+    n_rs_const = ir_constant(n_rs)
 
-    # Define output `shapes`.
-    output_shape_model_eval = input_shape
+    output_shape_model_eval = ir.RankedTensorType.get(shape, ir_dtype(data_type))
     shape_derivatives = shape + (6 + 4 + n_rs,)
-    dims_order_derivatives = tuple(range(len(shape), -1, -1))
-    output_shape_model_derivatives = xla_client.Shape.array_shape(
-        data_type, shape_derivatives, dims_order_derivatives)
+    output_shape_model_derivatives = ir.RankedTensorType.get(shape_derivatives, ir_dtype(data_type))
 
-    return xla_client.ops.CustomCallWithLayout(
-        c,
+    return custom_call(
         b"jax_light_curve_nonlinear_ld",
-        operands=(n_times_input, n_rs_input, timesc, *paramssc),
-        operand_shapes_with_layout=
-            (n_times_shape, n_rs_shape, input_shape)
-            + rs_input_shapes,
-        shape_with_layout=xla_client.Shape.tuple_shape(
-            (output_shape_model_eval,
-             output_shape_model_derivatives)))
+        result_types=[output_shape_model_eval, output_shape_model_derivatives],
+        operands=[n_times_const, n_rs_const, timesc, *paramssc],
+        operand_layouts=[(), (), list(reversed(range(len(shape))))] + [list(reversed(range(len(shape))))] * len(paramssc),
+        result_layouts=[list(reversed(range(len(shape)))), list(reversed(range(len(shape_derivatives))))]
+    ).results
 
 
 def jax_light_curve_nonlinear_ld_value_and_jvp(arg_values, arg_tangents):
@@ -291,17 +299,25 @@ xla_client.register_custom_call_target(
 # Create a primitive for quad ld.
 jax_light_curve_quad_ld_p = jax.core.Primitive('jax_light_curve_quad_ld')
 jax_light_curve_quad_ld_p.multiple_results = True
-jax_light_curve_quad_ld_p.def_impl(partial(xla.apply_primitive, jax_light_curve_quad_ld_p))
+# jax_light_curve_quad_ld_p.def_impl(partial(xla.apply_primitive, jax_light_curve_quad_ld_p))
+def impl_quad_ld(*args):
+    return jax_light_curve_quad_ld_prim(*args)
+# jax_light_curve_quad_ld_p.def_impl(impl_quad_ld)
 jax_light_curve_quad_ld_p.def_abstract_eval(jax_light_curve_quad_ld_abstract_eval)
-xla.backend_specific_translations['cpu'][jax_light_curve_quad_ld_p] = \
-    jax_light_curve_quad_ld_xla_translation
+# xla.backend_specific_translations['cpu'][jax_light_curve_quad_ld_p] = \
+#     jax_light_curve_quad_ld_xla_translation
+mlir.register_lowering(jax_light_curve_quad_ld_p, jax_light_curve_quad_ld_xla_translation, platform='cpu')
 ad.primitive_jvps[jax_light_curve_quad_ld_p] = jax_light_curve_quad_ld_value_and_jvp
 
 # Create a primitive for non-linear ld.
 jax_light_curve_nonlinear_ld_p = jax.core.Primitive('jax_light_curve_nonlinear_ld')
 jax_light_curve_nonlinear_ld_p.multiple_results = True
-jax_light_curve_nonlinear_ld_p.def_impl(partial(xla.apply_primitive, jax_light_curve_nonlinear_ld_p))
+# jax_light_curve_nonlinear_ld_p.def_impl(partial(xla.apply_primitive, jax_light_curve_nonlinear_ld_p))
+def impl_nonlinear_ld(*args):
+    return jax_light_curve_nonlinear_ld_prim(*args)
+# jax_light_curve_nonlinear_ld_p.def_impl(impl_nonlinear_ld)
 jax_light_curve_nonlinear_ld_p.def_abstract_eval(jax_light_curve_nonlinear_ld_abstract_eval)
-xla.backend_specific_translations['cpu'][jax_light_curve_nonlinear_ld_p] = \
-    jax_light_curve_nonlinear_xla_translation
+# xla.backend_specific_translations['cpu'][jax_light_curve_nonlinear_ld_p] = \
+#     jax_light_curve_nonlinear_xla_translation
+mlir.register_lowering(jax_light_curve_nonlinear_ld_p, jax_light_curve_nonlinear_xla_translation, platform='cpu')
 ad.primitive_jvps[jax_light_curve_nonlinear_ld_p] = jax_light_curve_nonlinear_ld_value_and_jvp
