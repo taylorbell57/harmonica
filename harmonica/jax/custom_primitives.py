@@ -73,19 +73,41 @@ def _harmonica_transit_common(primitive_fn, times, params, r):
             raise ValueError(f"Unexpected parameter shape: {p.shape}")
         broadcasted_params.append(p)
 
-    # Handle r: can be shape (k,) or (n, k)
-    # and apply flip if needed
-    r = jnp.asarray(r, dtype=jnp.float64)
+    # Flip sign of flux if r[0] is negative (model upside-down transit)
+    def shift_r0_if_needed(r_row):
+        r0 = r_row[0]
+        r_shifted = r_row.at[0].set(jnp.abs(r0))
+        return jnp.where(r0 < 0, r_shifted, r_row)
+
+    def replace_with_default_ripple(r_row):
+        fallback = r_row.at[1].set(1e-3)
+        if r_row.shape[0] > 3:
+            fallback = fallback.at[3].set(5e-4)
+        return fallback
+
+    def enforce_min_ripple(r_row):
+        if r_row.shape[0] < 2:
+            return r_row
+        ripple = r_row[1:]
+        rms = jnp.sqrt(jnp.mean(ripple ** 2))
+        return jax.lax.cond(rms < 1e-6, replace_with_default_ripple, lambda x: x, r_row)
+
     if r.ndim == 1:
         flip = r[0] < 0
-        r = jnp.abs(r)
-        r_list = [jnp.broadcast_to(r[i], (n,)) for i in range(r.shape[0])]
+        r = shift_r0_if_needed(r)
+        r = enforce_min_ripple(r)
     elif r.ndim == 2:
         flip = r[:, 0] < 0
-        r = jnp.abs(r)
-        r_list = [jnp.reshape(r[:, i], (n,)) for i in range(r.shape[1])]
+        r = jax.vmap(shift_r0_if_needed)(r)
+        r = jax.vmap(enforce_min_ripple)(r)
     else:
         raise ValueError(f"`r` must be shape (k,) or (n, k); got {r.shape}")
+
+    # Rebuild r_list after fixing r
+    if r.ndim == 1:
+        r_list = [jnp.broadcast_to(r[i], (n,)) for i in range(r.shape[0])]
+    else:
+        r_list = [jnp.reshape(r[:, i], (n,)) for i in range(r.shape[1])]
 
     # Combine all args and ensure all are float64 arrays.
     args = [jnp.asarray(arg, dtype=jnp.float64) for arg in
