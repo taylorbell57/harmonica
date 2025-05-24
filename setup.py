@@ -21,7 +21,7 @@ ext_modules = [
 
 setup(
     name="planet-harmonica",
-    version="0.1.2",
+    version="0.2.1",
     author="David Grant",
     author_email="david.grant@bristol.ac.uk",
     url="https://github.com/DavoGrant/harmonica",
